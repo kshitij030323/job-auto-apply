@@ -46,13 +46,13 @@ async def scrape_job_description(url: str) -> dict:
         if is_linkedin:
             browser = await p.chromium.launch_persistent_context(
                 user_data_dir=_BROWSER_DATA_DIR,
-                headless=True,
+                headless=Config.HEADLESS,
                 viewport={"width": 1280, "height": 900},
                 args=["--disable-blink-features=AutomationControlled"],
             )
             page = await browser.new_page()
         else:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=Config.HEADLESS)
             page = await browser.new_page()
 
         try:

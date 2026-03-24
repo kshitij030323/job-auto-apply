@@ -85,6 +85,11 @@ class AutoApplier:
             return True
 
         # Navigate to login
+        if not Config.LINKEDIN_EMAIL or not Config.LINKEDIN_PASSWORD:
+            log.error("LINKEDIN_EMAIL and LINKEDIN_PASSWORD must be set in .env")
+            await page.close()
+            return False
+
         await page.goto("https://www.linkedin.com/login")
         await page.fill("#username", Config.LINKEDIN_EMAIL)
         await page.fill("#password", Config.LINKEDIN_PASSWORD)
