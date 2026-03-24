@@ -10,10 +10,15 @@ load_dotenv()
 
 class Config:
 
-    # Qwen (OpenAI-compatible endpoint)
-    QWEN_API_KEY = os.getenv("QWEN_API_KEY")
-    QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-plus")
+    # LLM API (OpenAI-compatible endpoint — works with NVIDIA NIM, DashScope, OpenAI, etc.)
+    LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("QWEN_API_KEY")
+    LLM_BASE_URL = os.getenv("LLM_BASE_URL") or os.getenv("QWEN_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    LLM_MODEL = os.getenv("LLM_MODEL") or os.getenv("QWEN_MODEL", "qwen/qwen3.5-122b-a10b")
+
+    # Backwards compat aliases
+    QWEN_API_KEY = LLM_API_KEY
+    QWEN_BASE_URL = LLM_BASE_URL
+    QWEN_MODEL = LLM_MODEL
 
     # Google Sheets
     GSHEETS_CREDS = os.getenv("GOOGLE_SHEETS_CREDS_FILE", "credentials.json")

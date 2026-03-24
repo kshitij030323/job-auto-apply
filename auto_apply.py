@@ -1,16 +1,17 @@
 """
-auto_apply.py — Playwright-based auto-apply engine.
+auto_apply.py — AI-powered auto-apply engine.
+
+Uses an LLM (Qwen 3.5 via NVIDIA NIM) to understand web pages and
+intelligently fill job application forms — no brittle CSS selectors.
 
 Two modes:
-1. LinkedIn Easy Apply — logs in, clicks Easy Apply, fills steps, submits
-2. Generic portal — detects form fields, fills with personal info, uploads resume
+1. LinkedIn Easy Apply — AI navigates the modal step by step
+2. Generic portal — AI fills the form, leaves it for user review
 
 IMPORTANT: This runs YOUR browser on YOUR machine. It's your account, your actions.
-LinkedIn may flag aggressive automation — use slow_mo and reasonable delays.
 """
 import asyncio
 import logging
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -18,31 +19,17 @@ from pathlib import Path
 from playwright.async_api import async_playwright, Page, BrowserContext
 
 from config import Config
+from ai_agent import run_agent, extract_page_state, ask_ai
 
 log = logging.getLogger(__name__)
 
-# ─── Common field-matching patterns ───────────────────────────────────────────
-# Maps form field identifiers (label text, name attr, placeholder) to config keys
-FIELD_MAP = {
-    "first name": "first_name",
-    "first_name": "first_name",
-    "fname": "first_name",
-    "last name": "last_name",
-    "last_name": "last_name",
-    "lname": "last_name",
-    "full name": "name",
-    "your name": "name",
-    "name": "name",
-    "email": "email",
-    "e-mail": "email",
-    "phone": "phone",
-    "mobile": "phone",
-    "telephone": "phone",
-    "phone number": "phone",
-    "location": "location",
-    "city": "city",
-    "current location": "city",
-}
+
+def _load_resume_text() -> str:
+    """Load the plain-text resume for AI context."""
+    try:
+        return Config.BASE_RESUME_TEXT.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
 
 
 class AutoApplier:
@@ -63,10 +50,8 @@ class AutoApplier:
         except Exception as first_err:
             if "Opening in existing browser session" not in str(first_err):
                 raise
-            # A stale Chromium process is holding the profile lock.
             log.warning("Stale browser lock detected — cleaning up and retrying...")
             _kill_stale_chromium(data_dir)
-            # Remove the lock file so Chromium can start fresh
             lock_file = Path(data_dir) / "SingletonLock"
             lock_file.unlink(missing_ok=True)
             await asyncio.sleep(1)
@@ -89,10 +74,10 @@ class AutoApplier:
         if self.playwright:
             await self.playwright.stop()
 
-    # ─── LinkedIn Easy Apply ──────────────────────────────────────────────────
+    # ─── LinkedIn Login (AI-assisted) ──────────────────────────────────────────
 
     async def linkedin_login(self):
-        """Log into LinkedIn if not already logged in."""
+        """Log into LinkedIn — AI handles unexpected states."""
         page = await self.context.new_page()
         await page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
@@ -103,22 +88,32 @@ class AutoApplier:
             await page.close()
             return True
 
-        # Navigate to login
         if not Config.LINKEDIN_EMAIL or not Config.LINKEDIN_PASSWORD:
             log.error("LINKEDIN_EMAIL and LINKEDIN_PASSWORD must be set in .env")
             await page.close()
             return False
 
+        # Navigate to login page
         await page.goto("https://www.linkedin.com/login")
-        await page.fill("#username", Config.LINKEDIN_EMAIL)
-        await page.fill("#password", Config.LINKEDIN_PASSWORD)
-        await page.click("[type='submit']")
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(2000)
 
-        # Check for security challenge
-        if "checkpoint" in page.url or "challenge" in page.url:
-            log.warning("LinkedIn security challenge detected — solve it manually in the browser window!")
-            # Wait up to 2 minutes for manual resolution
+        # Let AI handle the login form — it can see what's on the page
+        login_info = dict(self.info)
+        login_info["linkedin_email"] = Config.LINKEDIN_EMAIL
+        login_info["linkedin_password"] = Config.LINKEDIN_PASSWORD
+
+        result = await run_agent(
+            page=page,
+            goal="Log into LinkedIn. Fill the email/username field with the linkedin_email and the password field with the linkedin_password, then click the Sign In button. If you see a security challenge or captcha, report needs_human.",
+            personal_info=login_info,
+            resume_text="",
+            max_steps=5,
+            on_step=lambda s, t: log.info("Login step %d: %s", s, t[:100]),
+        )
+
+        if result.get("needs_human"):
+            log.warning("Security challenge detected — solve it manually in the browser!")
+            # Wait for manual resolution
             for _ in range(24):
                 await page.wait_for_timeout(5000)
                 if "/feed" in page.url:
@@ -128,13 +123,36 @@ class AutoApplier:
                 await page.close()
                 return False
 
-        log.info("LinkedIn login successful")
+        await page.wait_for_timeout(3000)
+
+        # Verify login
+        if "/feed" in page.url or "/mynetwork" in page.url:
+            log.info("LinkedIn login successful")
+            await page.close()
+            return True
+
+        # Check current state
+        if "checkpoint" in page.url or "challenge" in page.url:
+            log.warning("Security challenge — solve it in the browser window!")
+            for _ in range(24):
+                await page.wait_for_timeout(5000)
+                if "/feed" in page.url:
+                    log.info("LinkedIn login successful after challenge")
+                    await page.close()
+                    return True
+            log.error("Login failed — challenge not resolved")
+            await page.close()
+            return False
+
+        log.info("LinkedIn login completed (url: %s)", page.url)
         await page.close()
         return True
 
-    async def linkedin_easy_apply(self, job_url: str) -> dict:
+    # ─── LinkedIn Easy Apply (AI-driven) ────────────────────────────────────────
+
+    async def linkedin_easy_apply(self, job_url: str, job_description: str = "", on_step: callable = None) -> dict:
         """
-        Apply to a LinkedIn job via Easy Apply.
+        Apply to a LinkedIn job via Easy Apply — AI navigates the entire flow.
         Returns: {"success": bool, "message": str}
         """
         page = await self.context.new_page()
@@ -144,7 +162,7 @@ class AutoApplier:
             await page.goto(job_url, wait_until="domcontentloaded")
             await page.wait_for_timeout(3000)
 
-            # Find and click Easy Apply button
+            # Click the Easy Apply button first
             easy_btn = page.locator("button.jobs-apply-button, button:has-text('Easy Apply')").first
             if await easy_btn.count() == 0:
                 result["message"] = "No Easy Apply button found — may require external application"
@@ -153,43 +171,31 @@ class AutoApplier:
             await easy_btn.click()
             await page.wait_for_timeout(2000)
 
-            # Walk through Easy Apply modal steps
-            max_steps = 10
-            for step in range(max_steps):
-                log.info("Easy Apply step %d", step + 1)
+            # Now let the AI handle the multi-step modal
+            resume_text = _load_resume_text()
+            agent_result = await run_agent(
+                page=page,
+                goal=(
+                    "You are inside a LinkedIn Easy Apply modal. Fill in all the form fields "
+                    "with my personal info. For each step:\n"
+                    "1. Fill all empty fields with appropriate values from my info\n"
+                    "2. Upload my resume if there's a file input\n"
+                    "3. Click 'Next', 'Review', or 'Submit application' to proceed\n"
+                    "4. When you see a confirmation/success message, report status 'done'\n"
+                    "5. For questions like years of experience, salary, etc. — answer reasonably based on my resume\n"
+                    "6. For Yes/No questions about work authorization, willingness to relocate, etc. — select Yes"
+                ),
+                personal_info=self.info,
+                resume_text=resume_text,
+                job_description=job_description,
+                max_steps=15,
+                on_step=on_step or (lambda s, t: log.info("Easy Apply step %d: %s", s, t[:100])),
+            )
 
-                # Fill any visible input fields
-                await self._fill_visible_fields(page)
-
-                # Upload resume if file input exists
-                file_input = page.locator("input[type='file']")
-                if await file_input.count() > 0:
-                    if Config.RESUME_PATH.exists():
-                        await file_input.set_input_files(str(Config.RESUME_PATH))
-                        log.info("Uploaded resume")
-                        await page.wait_for_timeout(1000)
-
-                # Check for Submit button (final step)
-                submit_btn = page.locator("button[aria-label*='Submit'], button:has-text('Submit application')")
-                if await submit_btn.count() > 0:
-                    await submit_btn.click()
-                    await page.wait_for_timeout(2000)
-                    result["success"] = True
-                    result["message"] = "Application submitted via Easy Apply"
-                    log.info("Application submitted!")
-                    return result
-
-                # Click Next / Review
-                next_btn = page.locator("button[aria-label='Continue to next step'], button:has-text('Next'), button:has-text('Review')")
-                if await next_btn.count() > 0:
-                    await next_btn.click()
-                    await page.wait_for_timeout(1500)
-                else:
-                    # No next or submit — might be stuck
-                    result["message"] = f"Got stuck at step {step + 1}. Check the browser window."
-                    return result
-
-            result["message"] = "Exceeded max steps without finding submit button"
+            result["success"] = agent_result.get("success", False)
+            result["message"] = agent_result.get("message", "")
+            if agent_result.get("success"):
+                result["message"] = f"Application submitted via Easy Apply ({agent_result['steps']} AI steps)"
             return result
 
         except Exception as e:
@@ -199,11 +205,11 @@ class AutoApplier:
         finally:
             await page.close()
 
-    # ─── Generic Portal Apply ─────────────────────────────────────────────────
+    # ─── Generic Portal Apply (AI-driven) ────────────────────────────────────────
 
-    async def generic_apply(self, apply_url: str) -> dict:
+    async def generic_apply(self, apply_url: str, job_description: str = "", on_step: callable = None) -> dict:
         """
-        Navigate to a custom job portal application page and fill the form.
+        AI-powered form filling for any job application portal.
         Returns: {"success": bool, "message": str, "needs_review": bool}
         """
         page = await self.context.new_page()
@@ -213,27 +219,28 @@ class AutoApplier:
             await page.goto(apply_url, wait_until="domcontentloaded")
             await page.wait_for_timeout(3000)
 
-            # Fill detectable fields
-            filled_count = await self._fill_visible_fields(page)
+            resume_text = _load_resume_text()
+            agent_result = await run_agent(
+                page=page,
+                goal=(
+                    "You are on a job application form. Fill in all the form fields "
+                    "with my personal info. Upload my resume if there's a file upload. "
+                    "Fill in all fields you can identify — name, email, phone, location, etc. "
+                    "For custom questions, answer based on my resume. "
+                    "Do NOT click the final Submit button — just fill all fields and report 'done'. "
+                    "The user will review and submit manually."
+                ),
+                personal_info=self.info,
+                resume_text=resume_text,
+                job_description=job_description,
+                max_steps=10,
+                on_step=on_step or (lambda s, t: log.info("Form fill step %d: %s", s, t[:100])),
+            )
 
-            # Upload resume to any file input
-            file_inputs = page.locator("input[type='file']")
-            for i in range(await file_inputs.count()):
-                fi = file_inputs.nth(i)
-                accept = await fi.get_attribute("accept") or ""
-                if any(ext in accept.lower() for ext in [".pdf", ".doc", "application/"]) or not accept:
-                    if Config.RESUME_PATH.exists():
-                        await fi.set_input_files(str(Config.RESUME_PATH))
-                        log.info("Uploaded resume to file input #%d", i)
-                        await page.wait_for_timeout(1000)
-                        break
-
-            result["message"] = f"Filled {filled_count} fields. Form is ready for your review."
-            result["needs_review"] = True  # Always pause for review on custom portals
             result["success"] = True
-
-            # Keep page open for manual review — don't auto-submit unknown forms
-            log.info("Generic form filled — awaiting manual review")
+            result["message"] = agent_result.get("message", f"AI filled form in {agent_result.get('steps', '?')} steps")
+            result["needs_review"] = True
+            log.info("AI form fill complete — awaiting manual review")
             return result
 
         except Exception as e:
@@ -241,63 +248,6 @@ class AutoApplier:
             log.error(result["message"])
             return result
         # NOTE: don't close page — let user review and submit manually
-
-    # ─── Field Detection & Filling ────────────────────────────────────────────
-
-    async def _fill_visible_fields(self, page: Page) -> int:
-        """
-        Detect visible form fields and fill them with personal info.
-        Returns count of fields filled.
-        """
-        filled = 0
-        inputs = page.locator("input[type='text'], input[type='email'], input[type='tel'], input:not([type])")
-
-        for i in range(await inputs.count()):
-            inp = inputs.nth(i)
-            if not await inp.is_visible():
-                continue
-
-            # Skip if already filled
-            current_val = await inp.input_value()
-            if current_val.strip():
-                continue
-
-            # Identify field by label, name, placeholder, or aria-label
-            identifier = await self._identify_field(page, inp)
-            if not identifier:
-                continue
-
-            # Look up what value to fill
-            config_key = FIELD_MAP.get(identifier.lower())
-            if config_key and config_key in self.info and self.info[config_key]:
-                await inp.fill(self.info[config_key])
-                filled += 1
-                log.debug("Filled '%s' → %s", identifier, config_key)
-
-        return filled
-
-    async def _identify_field(self, page: Page, element) -> str:
-        """Try to figure out what a form field is asking for."""
-        # Check aria-label
-        aria = await element.get_attribute("aria-label") or ""
-        if aria:
-            return aria.lower().strip()
-
-        # Check associated label
-        el_id = await element.get_attribute("id") or ""
-        if el_id:
-            label = page.locator(f"label[for='{el_id}']")
-            if await label.count() > 0:
-                return (await label.inner_text()).lower().strip()
-
-        # Check name attribute
-        name = await element.get_attribute("name") or ""
-        if name:
-            return name.lower().replace("_", " ").replace("-", " ").strip()
-
-        # Check placeholder
-        ph = await element.get_attribute("placeholder") or ""
-        return ph.lower().strip()
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -307,11 +257,9 @@ def _kill_stale_chromium(data_dir: str):
     """Kill any Chromium processes that are using the given user-data-dir."""
     try:
         if sys.platform == "win32":
-            # On Windows, use taskkill (best-effort)
             subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"],
                            capture_output=True, timeout=5)
         else:
-            # On macOS/Linux, find processes with our specific data dir
             result = subprocess.run(
                 ["pgrep", "-f", f"--user-data-dir={data_dir}"],
                 capture_output=True, text=True, timeout=5,

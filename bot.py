@@ -47,7 +47,8 @@ RESET = "\033[0m"
 def _banner():
     print(f"""
 {CYAN}{BOLD}╔══════════════════════════════════════════════════════╗
-║           🤖  Job Auto-Apply Bot  (CLI)              ║
+║        🤖  Job Auto-Apply Bot  (AI-Powered)          ║
+║          Qwen 3.5 122B via NVIDIA NIM                ║
 ╚══════════════════════════════════════════════════════╝{RESET}
 {DIM}Type 'help' to see available commands.{RESET}
 """)
@@ -230,14 +231,18 @@ async def do_apply(url: str):
     tailored = tailor_resume(job.get("description", ""))
     keywords = extract_keywords(job.get("description", ""))
 
-    # Step 3: Apply
-    print(f"{YELLOW}🚀 Step 3/4: Applying...{RESET}")
+    # Step 3: Apply (AI-powered)
+    print(f"{YELLOW}🚀 Step 3/4: AI is applying...{RESET}")
     applier = await get_applier()
 
+    def _on_step(step_num, thinking):
+        print(f"  {DIM}🤖 Step {step_num}: {thinking[:120]}{RESET}")
+
+    jd = job.get("description", "")
     if "linkedin.com" in url:
-        result = await applier.linkedin_easy_apply(url)
+        result = await applier.linkedin_easy_apply(url, job_description=jd, on_step=_on_step)
     else:
-        result = await applier.generic_apply(url)
+        result = await applier.generic_apply(url, job_description=jd, on_step=_on_step)
 
     # Step 4: Log to Sheets
     status = "Applied" if result["success"] else "Failed"
@@ -270,10 +275,14 @@ async def do_apply(url: str):
 
 
 async def do_fill(url: str):
-    """Fill a form without submitting."""
-    print(f"{CYAN}⏳ Opening form and filling fields...{RESET}")
+    """Fill a form without submitting — AI-powered."""
+    print(f"{CYAN}⏳ AI is analyzing the form and filling fields...{RESET}")
     applier = await get_applier()
-    result = await applier.generic_apply(url)
+
+    def _on_step(step_num, thinking):
+        print(f"  {DIM}🤖 Step {step_num}: {thinking[:120]}{RESET}")
+
+    result = await applier.generic_apply(url, on_step=_on_step)
     emoji = f"{GREEN}✅" if result["success"] else f"{RED}❌"
     print(f"{emoji} {result['message']}{RESET}")
     print(f"{YELLOW}Browser window is open — review and submit manually.{RESET}\n")
@@ -463,9 +472,9 @@ def _preflight_check():
         print()
 
     # ── API key check (non-interactive, just warn) ──
-    if not Config.QWEN_API_KEY:
-        print(f"{YELLOW}⚠  QWEN_API_KEY is not set in .env (needed for resume tailoring){RESET}")
-        print(f"{DIM}  Get one at https://dashscope.console.aliyun.com/{RESET}\n")
+    if not Config.LLM_API_KEY:
+        print(f"{YELLOW}⚠  LLM_API_KEY is not set in .env (needed for AI automation & resume tailoring){RESET}")
+        print(f"{DIM}  Set LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL in your .env file{RESET}\n")
 
     # ── Show summary ──
     info = Config.personal_info()
