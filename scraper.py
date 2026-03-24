@@ -1,16 +1,29 @@
 """
 scraper.py — Extracts job description text from a URL using Playwright.
-Works for LinkedIn, Lever, Greenhouse, Workday, and generic pages.
+
+Uses AI (Qwen 3.5 via NVIDIA NIM) to extract structured job info from
+raw page text — no brittle CSS selectors that break when sites update.
 """
+import json
 import logging
 import re
 from urllib.parse import urlparse, parse_qs
 
+from openai import OpenAI
 from playwright.async_api import async_playwright, Page
 
 from config import Config
 
 log = logging.getLogger(__name__)
+
+_client = None
+
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(api_key=Config.LLM_API_KEY, base_url=Config.LLM_BASE_URL)
+    return _client
 
 
 def _normalize_linkedin_url(url: str) -> str:
@@ -28,39 +41,26 @@ def _normalize_linkedin_url(url: str) -> str:
 
 async def scrape_job_description(url: str) -> dict:
     """
-    Visit a job URL, extract structured info.
+    Visit a job URL, extract structured info using AI.
     Returns: {"title": str, "company": str, "description": str, "url": str}
-
-    For LinkedIn URLs, reuses the existing AutoApplier browser session
-    (which holds login cookies) instead of launching a second persistent
-    context on the same profile directory.
     """
     is_linkedin = "linkedin.com" in url
 
     if is_linkedin:
         url = _normalize_linkedin_url(url)
-
-    # For LinkedIn, try to reuse the running AutoApplier browser session.
-    # This avoids the "profile already locked" crash when both the applier
-    # and scraper try to open the same persistent browser directory.
-    if is_linkedin:
         return await _scrape_with_applier_browser(url)
 
     # For non-LinkedIn URLs, launch a standalone browser.
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=Config.HEADLESS)
+        browser = await p.chromium.launch(
+            headless=Config.HEADLESS,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         page = await browser.new_page()
-
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)  # let JS render
-
-            if "lever.co" in url:
-                return await _extract_lever(page, url)
-            elif "greenhouse.io" in url or "boards.greenhouse" in url:
-                return await _extract_greenhouse(page, url)
-            else:
-                return await _extract_generic(page, url)
+            await page.wait_for_timeout(3000)
+            return await _extract_with_ai(page, url)
         except Exception as e:
             log.error("Scraping failed for %s: %s (type: %s)", url, e, type(e).__name__)
             return {"title": "", "company": "", "description": "", "url": url}
@@ -80,12 +80,12 @@ async def _scrape_with_applier_browser(url: str) -> dict:
         page = await applier.context.new_page()
     except Exception as e:
         log.warning("Shared browser not available (%s), launching standalone browser", e)
-        return await _scrape_linkedin_standalone(url)
+        return await _scrape_standalone(url)
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(3000)
-        return await _extract_linkedin(page, url)
+        await page.wait_for_timeout(4000)
+        return await _extract_with_ai(page, url)
     except Exception as e:
         log.error("Scraping failed for %s: %s (type: %s)", url, e, type(e).__name__)
         return {"title": "", "company": "", "description": "", "url": url}
@@ -93,8 +93,8 @@ async def _scrape_with_applier_browser(url: str) -> dict:
         await page.close()
 
 
-async def _scrape_linkedin_standalone(url: str) -> dict:
-    """Fallback: scrape LinkedIn with a fresh non-persistent browser."""
+async def _scrape_standalone(url: str) -> dict:
+    """Fallback: scrape with a fresh non-persistent browser."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=Config.HEADLESS,
@@ -103,8 +103,8 @@ async def _scrape_linkedin_standalone(url: str) -> dict:
         page = await browser.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
-            return await _extract_linkedin(page, url)
+            await page.wait_for_timeout(4000)
+            return await _extract_with_ai(page, url)
         except Exception as e:
             log.error("Scraping failed for %s: %s (type: %s)", url, e, type(e).__name__)
             return {"title": "", "company": "", "description": "", "url": url}
@@ -113,87 +113,129 @@ async def _scrape_linkedin_standalone(url: str) -> dict:
             await browser.close()
 
 
-async def _extract_linkedin(page: Page, url: str) -> dict:
-    # Wait for job detail content to load
+# ─── AI-Powered Extraction ───────────────────────────────────────────────────
+
+_EXTRACT_PAGE_TEXT_JS = """
+() => {
+    // Get all visible text from the page, structured by sections
+    const parts = [];
+
+    // Title - try multiple approaches
+    const h1 = document.querySelector('h1');
+    if (h1) parts.push('PAGE_TITLE: ' + h1.innerText.trim());
+
+    // Get the full body text — the AI will parse it
+    const body = document.body.innerText || '';
+    parts.push(body);
+
+    return parts.join('\\n');
+}
+"""
+
+
+async def _extract_with_ai(page: Page, url: str) -> dict:
+    """
+    Extract job info by grabbing ALL visible page text and asking the AI
+    to parse out the title, company, and description. No CSS selectors needed.
+    """
+    # Step 1: Get raw page text
     try:
-        await page.wait_for_selector(
-            ".description__text, .show-more-less-html__markup, "
-            ".jobs-description__content, .jobs-description, "
-            "section.description, .job-details-jobs-unified-top-card__job-title",
-            timeout=10000,
+        raw_text = await page.evaluate(_EXTRACT_PAGE_TEXT_JS)
+    except Exception as e:
+        log.error("Failed to extract page text: %s", e)
+        return {"title": "", "company": "", "description": "", "url": url}
+
+    if not raw_text or len(raw_text.strip()) < 50:
+        log.warning("Page has very little text content (%d chars)", len(raw_text or ""))
+        return {"title": "", "company": "", "description": "", "url": url}
+
+    # Truncate to avoid token limits (keep first 6000 chars — enough for any JD)
+    raw_text = raw_text[:6000]
+
+    # Step 2: Ask AI to extract structured info
+    if not Config.LLM_API_KEY:
+        log.warning("No LLM_API_KEY set — falling back to raw text extraction")
+        return _fallback_extract(raw_text, url)
+
+    try:
+        client = _get_client()
+        resp = client.chat.completions.create(
+            model=Config.LLM_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "You extract job posting information from raw web page text. "
+                    "Return ONLY a JSON object with these fields:\n"
+                    '{"title": "job title", "company": "company name", "description": "full job description text"}\n'
+                    "For the description, include ALL the job details: responsibilities, requirements, qualifications, benefits, etc. "
+                    "Do NOT summarize — keep the full text. Do NOT add commentary. "
+                    "If you cannot find a field, use an empty string."
+                )},
+                {"role": "user", "content": f"Extract the job posting info from this page text:\n\n{raw_text}"},
+            ],
+            temperature=0.1,
+            max_tokens=3000,
         )
-    except Exception:
-        log.warning("LinkedIn job detail selectors did not appear — page may require login")
+        raw_resp = resp.choices[0].message.content.strip()
+        result = _parse_json_response(raw_resp)
+        result["url"] = url
 
-    title = await _safe_text(
-        page,
-        "h1.top-card-layout__title, h1.topcard__title, "
-        ".job-details-jobs-unified-top-card__job-title, "
-        ".jobs-unified-top-card__job-title, h1",
-    )
-    company = await _safe_text(
-        page,
-        "a.topcard__org-name-link, "
-        ".top-card-layout__second-subline a, "
-        ".topcard__flavor--black-link, "
-        ".job-details-jobs-unified-top-card__company-name, "
-        ".jobs-unified-top-card__company-name",
-    )
-    desc = await _safe_text(
-        page,
-        ".description__text, "
-        ".show-more-less-html__markup, "
-        ".jobs-description__content, "
-        ".jobs-description, "
-        "section.description, "
-        "article.jobs-description__container",
-    )
+        if result.get("description"):
+            log.info("AI extracted JD: '%s' at '%s' (%d chars)",
+                     result.get("title", "")[:50], result.get("company", "")[:30],
+                     len(result["description"]))
+        else:
+            log.warning("AI could not extract description from page")
+            # Fall back to raw text
+            fb = _fallback_extract(raw_text, url)
+            if fb["description"]:
+                return fb
 
-    if not desc:
-        log.warning("No job description found on LinkedIn page: %s", url)
+        return result
 
-    return {"title": title, "company": company, "description": _clean(desc), "url": url}
+    except Exception as e:
+        log.error("AI extraction failed: %s — falling back to raw text", e)
+        return _fallback_extract(raw_text, url)
 
 
-async def _extract_lever(page: Page, url: str) -> dict:
-    title = await _safe_text(page, "h2.posting-headline, .posting-headline h2")
-    company = await _safe_text(page, ".main-header-logo a, .posting-categories .sort-by-time, .company-name")
-    desc = await _safe_text(page, "[data-qa='job-description'], .section-wrapper.page-full-width, .posting-page")
-    return {"title": title, "company": company, "description": _clean(desc), "url": url}
+def _parse_json_response(raw: str) -> dict:
+    """Parse JSON from AI response, handling markdown blocks and think tags."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-
-async def _extract_greenhouse(page: Page, url: str) -> dict:
-    title = await _safe_text(page, "h1.app-title, .app-title")
-    company = await _safe_text(page, "span.company-name, .company-name")
-    desc = await _safe_text(page, "#content, .content")
-    return {"title": title, "company": company, "description": _clean(desc), "url": url}
-
-
-async def _extract_generic(page: Page, url: str) -> dict:
-    title = await _safe_text(page, "h1")
-    # Try common patterns for company name
-    company = await _safe_text(page, "[class*='company'], [class*='org'], [data-company], [class*='employer']")
-    # Get the main content area
-    desc = await _safe_text(page, "main, article, [role='main'], .job-description, #job-description, [class*='description']")
-    if not desc:
-        desc = await _safe_text(page, "body")
-    desc = desc[:5000] if desc else ""
-    return {"title": title, "company": company, "description": _clean(desc), "url": url}
-
-
-async def _safe_text(page: Page, selector: str) -> str:
-    """Safely extract text from the first matching element."""
     try:
-        locator = page.locator(selector)
-        if await locator.count() > 0:
-            return (await locator.first.inner_text()).strip()
-    except Exception:
-        pass
-    return ""
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+        return {"title": "", "company": "", "description": ""}
 
 
-def _clean(text: str) -> str:
-    """Collapse whitespace, strip cruft."""
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
+def _fallback_extract(raw_text: str, url: str) -> dict:
+    """
+    Simple text-based fallback when AI is unavailable.
+    Grabs the first h1-like line as title and the bulk text as description.
+    """
+    lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
+    title = ""
+    company = ""
+    desc_lines = []
+
+    for i, line in enumerate(lines):
+        if line.startswith("PAGE_TITLE: "):
+            title = line.replace("PAGE_TITLE: ", "")
+            continue
+        desc_lines.append(line)
+
+    description = "\n".join(desc_lines).strip()
+    # Clean up
+    description = re.sub(r"\n{3,}", "\n\n", description)
+    description = description[:5000]
+
+    return {"title": title, "company": company, "description": description, "url": url}
