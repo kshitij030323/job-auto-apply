@@ -1,5 +1,6 @@
 """
-resume_tailor.py — Uses Qwen API (OpenAI-compatible) to tailor resume text to a job description.
+resume_tailor.py — Uses LLM API (OpenAI-compatible) to tailor resume text to a job description.
+Supports NVIDIA NIM, DashScope, OpenAI, or any compatible endpoint.
 """
 import logging
 from openai import OpenAI
@@ -8,8 +9,8 @@ from config import Config
 log = logging.getLogger(__name__)
 
 client = OpenAI(
-    api_key=Config.QWEN_API_KEY,
-    base_url=Config.QWEN_BASE_URL,
+    api_key=Config.LLM_API_KEY,
+    base_url=Config.LLM_BASE_URL,
 )
 
 SYSTEM_PROMPT = """You are a resume optimization expert. Given a base resume and a job description,
@@ -53,7 +54,7 @@ Produce the tailored resume now."""
 
     try:
         resp = client.chat.completions.create(
-            model=Config.QWEN_MODEL,
+            model=Config.LLM_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -73,7 +74,7 @@ def extract_keywords(job_description: str) -> list[str]:
     """Extract key skills/keywords from a JD for quick matching."""
     try:
         resp = client.chat.completions.create(
-            model=Config.QWEN_MODEL,
+            model=Config.LLM_MODEL,
             messages=[
                 {"role": "system", "content": "Extract the top 10 technical skills and keywords from this job description. Return ONLY a comma-separated list, nothing else."},
                 {"role": "user", "content": job_description},
@@ -107,7 +108,7 @@ Output ONLY the paragraph, no greeting/sign-off."""
 
     try:
         resp = client.chat.completions.create(
-            model=Config.QWEN_MODEL,
+            model=Config.LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.5,
             max_tokens=300,
