@@ -42,7 +42,7 @@ class Config:
             "name": cls.YOUR_NAME,
             "full_name": cls.YOUR_NAME,
             "first_name": cls.YOUR_NAME.split()[0] if cls.YOUR_NAME else "",
-            "last_name": cls.YOUR_NAME.split()[-1] if cls.YOUR_NAME else "",
+            "last_name": cls.YOUR_NAME.split()[-1] if len(cls.YOUR_NAME.split()) > 1 else "",
             "email": cls.YOUR_EMAIL,
             "phone": cls.YOUR_PHONE,
             "location": cls.YOUR_LOCATION,

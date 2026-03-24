@@ -33,50 +33,51 @@ async def scrape_job_description(url: str) -> dict:
             else:
                 return await _extract_generic(page, url)
         except Exception as e:
-            log.error("Scraping failed for %s: %s", url, e)
+            log.error("Scraping failed for %s: %s (type: %s)", url, e, type(e).__name__)
             return {"title": "", "company": "", "description": "", "url": url}
         finally:
             await browser.close()
 
 
 async def _extract_linkedin(page: Page, url: str) -> dict:
-    title = await _safe_text(page, "h1.top-card-layout__title, h1.topcard__title, h1")
-    company = await _safe_text(page, "a.topcard__org-name-link, .top-card-layout__second-subline a, .topcard__flavor--black-link")
-    desc = await _safe_text(page, ".description__text, .show-more-less-html__markup, section.description")
+    title = await _safe_text(page, "h1.top-card-layout__title, h1.topcard__title, .job-details-jobs-unified-top-card__job-title, h1")
+    company = await _safe_text(page, "a.topcard__org-name-link, .top-card-layout__second-subline a, .topcard__flavor--black-link, .job-details-jobs-unified-top-card__company-name")
+    desc = await _safe_text(page, ".description__text, .show-more-less-html__markup, .jobs-description__content, section.description")
     return {"title": title, "company": company, "description": _clean(desc), "url": url}
 
 
 async def _extract_lever(page: Page, url: str) -> dict:
-    title = await _safe_text(page, "h2.posting-headline")
-    company = await _safe_text(page, ".main-header-logo a, .posting-categories .sort-by-time")
-    desc = await _safe_text(page, "[data-qa='job-description'], .section-wrapper.page-full-width")
+    title = await _safe_text(page, "h2.posting-headline, .posting-headline h2")
+    company = await _safe_text(page, ".main-header-logo a, .posting-categories .sort-by-time, .company-name")
+    desc = await _safe_text(page, "[data-qa='job-description'], .section-wrapper.page-full-width, .posting-page")
     return {"title": title, "company": company, "description": _clean(desc), "url": url}
 
 
 async def _extract_greenhouse(page: Page, url: str) -> dict:
-    title = await _safe_text(page, "h1.app-title")
-    company = await _safe_text(page, "span.company-name")
-    desc = await _safe_text(page, "#content")
+    title = await _safe_text(page, "h1.app-title, .app-title")
+    company = await _safe_text(page, "span.company-name, .company-name")
+    desc = await _safe_text(page, "#content, .content")
     return {"title": title, "company": company, "description": _clean(desc), "url": url}
 
 
 async def _extract_generic(page: Page, url: str) -> dict:
     title = await _safe_text(page, "h1")
     # Try common patterns for company name
-    company = await _safe_text(page, "[class*='company'], [class*='org'], [data-company]")
+    company = await _safe_text(page, "[class*='company'], [class*='org'], [data-company], [class*='employer']")
     # Get the main content area
-    desc = await _safe_text(page, "main, article, [role='main'], .job-description, #job-description")
+    desc = await _safe_text(page, "main, article, [role='main'], .job-description, #job-description, [class*='description']")
     if not desc:
         desc = await _safe_text(page, "body")
-    return {"title": title, "company": company, "description": _clean(desc[:5000]), "url": url}
+    desc = desc[:5000] if desc else ""
+    return {"title": title, "company": company, "description": _clean(desc), "url": url}
 
 
 async def _safe_text(page: Page, selector: str) -> str:
     """Safely extract text from the first matching element."""
     try:
-        el = page.locator(selector).first
-        if await el.count() > 0:
-            return (await el.inner_text()).strip()
+        locator = page.locator(selector)
+        if await locator.count() > 0:
+            return (await locator.first.inner_text()).strip()
     except Exception:
         pass
     return ""
