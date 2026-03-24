@@ -10,6 +10,9 @@ LinkedIn may flag aggressive automation — use slow_mo and reasonable delays.
 """
 import asyncio
 import logging
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from playwright.async_api import async_playwright, Page, BrowserContext
@@ -53,16 +56,32 @@ class AutoApplier:
 
     async def start(self):
         """Launch browser with persistent state (saves login cookies)."""
+        data_dir = str(Path.home() / ".job-bot-browser")
         self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=str(Path.home() / ".job-bot-browser"),
+        try:
+            self.browser = await self._launch_persistent(data_dir)
+        except Exception as first_err:
+            if "Opening in existing browser session" not in str(first_err):
+                raise
+            # A stale Chromium process is holding the profile lock.
+            log.warning("Stale browser lock detected — cleaning up and retrying...")
+            _kill_stale_chromium(data_dir)
+            # Remove the lock file so Chromium can start fresh
+            lock_file = Path(data_dir) / "SingletonLock"
+            lock_file.unlink(missing_ok=True)
+            await asyncio.sleep(1)
+            self.browser = await self._launch_persistent(data_dir)
+        self.context = self.browser
+        log.info("Browser started (headless=%s)", Config.HEADLESS)
+
+    async def _launch_persistent(self, data_dir: str):
+        return await self.playwright.chromium.launch_persistent_context(
+            user_data_dir=data_dir,
             headless=Config.HEADLESS,
             slow_mo=Config.SLOW_MO,
             viewport={"width": 1280, "height": 900},
             args=["--disable-blink-features=AutomationControlled"],
         )
-        self.context = self.browser
-        log.info("Browser started (headless=%s)", Config.HEADLESS)
 
     async def stop(self):
         if self.browser:
@@ -279,6 +298,31 @@ class AutoApplier:
         # Check placeholder
         ph = await element.get_attribute("placeholder") or ""
         return ph.lower().strip()
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _kill_stale_chromium(data_dir: str):
+    """Kill any Chromium processes that are using the given user-data-dir."""
+    try:
+        if sys.platform == "win32":
+            # On Windows, use taskkill (best-effort)
+            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"],
+                           capture_output=True, timeout=5)
+        else:
+            # On macOS/Linux, find processes with our specific data dir
+            result = subprocess.run(
+                ["pgrep", "-f", f"--user-data-dir={data_dir}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pids = result.stdout.strip().split()
+            for pid in pids:
+                if pid:
+                    log.info("Killing stale Chromium process %s", pid)
+                    subprocess.run(["kill", "-9", pid], capture_output=True, timeout=5)
+    except Exception as e:
+        log.debug("Could not kill stale Chromium: %s", e)
 
 
 # ─── Module-level convenience functions ───────────────────────────────────────
