@@ -82,7 +82,12 @@ def extract_keywords(job_description: str) -> list[str]:
             max_tokens=200,
         )
         raw = resp.choices[0].message.content.strip()
-        return [kw.strip() for kw in raw.split(",") if kw.strip()]
+        # Handle both comma-separated and newline-separated responses
+        if "," in raw:
+            keywords = raw.split(",")
+        else:
+            keywords = raw.split("\n")
+        return [kw.strip().lstrip("•-0123456789. ") for kw in keywords if kw.strip()]
     except Exception as e:
         log.error("Keyword extraction failed: %s", e)
         return []

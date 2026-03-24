@@ -211,7 +211,7 @@ async def do_apply(url: str):
     # Step 1: Scrape JD
     print(f"{YELLOW}📄 Step 1/4: Scraping job description...{RESET}")
     job = await scrape_job_description(url)
-    if not job["description"]:
+    if not job.get("description"):
         print(f"{RED}❌ Couldn't extract job description. Try 'fill' instead for manual mode.{RESET}")
         return
 
@@ -222,8 +222,8 @@ async def do_apply(url: str):
 
     # Step 2: Tailor resume
     print(f"{YELLOW}🧠 Step 2/4: Tailoring resume...{RESET}")
-    tailored = tailor_resume(job["description"])
-    keywords = extract_keywords(job["description"])
+    tailored = tailor_resume(job.get("description", ""))
+    keywords = extract_keywords(job.get("description", ""))
 
     # Step 3: Apply
     print(f"{YELLOW}🚀 Step 3/4: Applying...{RESET}")
@@ -278,13 +278,13 @@ async def do_tailor(url: str):
     """Tailor resume only — no apply."""
     print(f"{CYAN}📄 Scraping job description...{RESET}")
     job = await scrape_job_description(url)
-    if not job["description"]:
+    if not job.get("description"):
         print(f"{RED}❌ Couldn't extract job description from that URL.{RESET}")
         return
 
     print(f"{CYAN}🧠 Tailoring your resume...{RESET}")
-    tailored = tailor_resume(job["description"])
-    keywords = extract_keywords(job["description"])
+    tailored = tailor_resume(job.get("description", ""))
+    keywords = extract_keywords(job.get("description", ""))
 
     title = job.get("title") or "Job"
     company = job.get("company") or ""
@@ -303,12 +303,12 @@ async def do_cover(url: str):
     """Generate cover letter for a job URL."""
     print(f"{CYAN}📄 Scraping job description...{RESET}")
     job = await scrape_job_description(url)
-    if not job["description"]:
+    if not job.get("description"):
         print(f"{RED}❌ Couldn't extract job description.{RESET}")
         return
 
     print(f"{CYAN}✍️  Writing cover letter...{RESET}")
-    letter = generate_cover_letter(job["description"], job.get("company", ""))
+    letter = generate_cover_letter(job.get("description", ""), job.get("company", ""))
     print(f"\n{BOLD}✉️  Cover Letter:{RESET}\n{letter}\n")
 
 
