@@ -21,7 +21,7 @@ from pathlib import Path
 
 from config import Config
 from scraper import scrape_job_description
-from resume_tailor import tailor_resume, extract_keywords, generate_cover_letter
+from resume_tailor import extract_keywords, generate_cover_letter, tailor_resume
 from sheets_tracker import log_application, get_stats
 from auto_apply import get_applier, shutdown_applier
 
@@ -211,43 +211,40 @@ async def do_login():
 
 
 async def do_apply(url: str):
-    """Full pipeline: scrape → tailor → apply → log."""
-    print(f"\n{CYAN}⏳ Starting full apply pipeline...{RESET}")
+    """Full pipeline: scrape → apply (AI-powered) → log. No resume tailoring."""
+    print(f"\n{CYAN}⏳ Starting apply pipeline...{RESET}")
 
     # Step 1: Scrape JD
-    print(f"{YELLOW}📄 Step 1/4: Scraping job description...{RESET}")
+    print(f"{YELLOW}📄 Step 1/3: Scraping job description...{RESET}")
     job = await scrape_job_description(url)
-    if not job.get("description"):
-        print(f"{RED}❌ Couldn't extract job description. Try 'fill' instead for manual mode.{RESET}")
-        return
 
     title = job.get("title") or "Unknown Role"
     company = job.get("company") or ""
-    header = f"{BOLD}{title}{RESET}" + (f" at {BOLD}{company}{RESET}" if company else "")
-    print(f"  Found: {header}")
+    jd = job.get("description") or ""
+    if title or company:
+        header = f"{BOLD}{title}{RESET}" + (f" at {BOLD}{company}{RESET}" if company else "")
+        print(f"  Found: {header}")
+    if not jd:
+        print(f"{YELLOW}⚠  Couldn't extract JD — AI will still try to apply using what it sees on screen.{RESET}")
 
-    # Step 2: Tailor resume
-    print(f"{YELLOW}🧠 Step 2/4: Tailoring resume...{RESET}")
-    tailored = tailor_resume(job.get("description", ""))
-    keywords = extract_keywords(job.get("description", ""))
-
-    # Step 3: Apply (AI-powered)
-    print(f"{YELLOW}🚀 Step 3/4: AI is applying...{RESET}")
+    # Step 2: Apply (AI-powered — screenshots every step)
+    print(f"{YELLOW}🚀 Step 2/3: AI is applying...{RESET}")
     applier = await get_applier()
 
     def _on_step(step_num, thinking):
         print(f"  {DIM}🤖 Step {step_num}: {thinking[:120]}{RESET}")
 
-    jd = job.get("description", "")
     if "linkedin.com" in url:
         result = await applier.linkedin_easy_apply(url, job_description=jd, on_step=_on_step)
     else:
         result = await applier.generic_apply(url, job_description=jd, on_step=_on_step)
 
-    # Step 4: Log to Sheets
+    # Step 3: Log to Sheets
     status = "Applied" if result["success"] else "Failed"
     if result.get("needs_review"):
         status = "Pending Review"
+
+    keywords = extract_keywords(jd) if jd else []
 
     log_application(
         company=company or "Unknown",
@@ -258,7 +255,6 @@ async def do_apply(url: str):
         notes=result["message"],
     )
 
-    # Report back
     emoji = f"{GREEN}✅" if result["success"] else f"{RED}❌"
     print(f"""
 {emoji} Application Result{RESET}
@@ -266,12 +262,7 @@ async def do_apply(url: str):
   🔗 {url}
   📊 Status: {status}
   💬 {result['message']}
-  🏷  Keywords: {', '.join(keywords[:5])}
 """)
-
-    if len(tailored) > 100:
-        print(f"{BOLD}📝 Tailored Resume Preview:{RESET}")
-        print(f"{DIM}{tailored[:3000]}{RESET}\n")
 
 
 async def do_fill(url: str):
