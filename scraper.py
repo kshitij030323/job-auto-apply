@@ -75,10 +75,12 @@ async def _scrape_with_applier_browser(url: str) -> dict:
 
     try:
         applier = await get_applier()
+        if applier.context is None:
+            raise RuntimeError("Browser session not available — run 'login' first")
         page = await applier.context.new_page()
     except Exception as e:
-        log.error("Could not get browser session for scraping: %s", e)
-        return {"title": "", "company": "", "description": "", "url": url}
+        log.warning("Shared browser not available (%s), launching standalone browser", e)
+        return await _scrape_linkedin_standalone(url)
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -89,6 +91,26 @@ async def _scrape_with_applier_browser(url: str) -> dict:
         return {"title": "", "company": "", "description": "", "url": url}
     finally:
         await page.close()
+
+
+async def _scrape_linkedin_standalone(url: str) -> dict:
+    """Fallback: scrape LinkedIn with a fresh non-persistent browser."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=Config.HEADLESS,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        page = await browser.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+            return await _extract_linkedin(page, url)
+        except Exception as e:
+            log.error("Scraping failed for %s: %s (type: %s)", url, e, type(e).__name__)
+            return {"title": "", "company": "", "description": "", "url": url}
+        finally:
+            await page.close()
+            await browser.close()
 
 
 async def _extract_linkedin(page: Page, url: str) -> dict:
