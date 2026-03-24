@@ -1,0 +1,37 @@
+FULL NAME
+Kshitij Gupta
+Bengaluru, India | [guptakshitij95@gmail.com](mailto:guptakshitij95@gmail.com) | +91-8368870730 | linkedin.com/in/yourprofile
+
+SUMMARY
+Computer Science Engineering (AI & ML) student with strong experience in full-stack development and AI systems. Built scalable platforms using Node.js, React, and cloud infrastructure, along with hands-on experience in LLMs, RAG, and model fine-tuning. Seeking opportunities to apply software engineering and AI skills in real-world products.
+
+EXPERIENCE
+
+ML Team Member — Google Developer Student Clubs (PES University)
+Feb 2026 – Present
+
+* Collaborating on AI/ML projects and participating in technical workshops and hackathons
+* Contributing to practical implementations of machine learning concepts in team-based environments
+* Strengthening knowledge in applied AI through hands-on development and peer collaboration
+
+SKILLS
+Languages: Python, Java, C++, SQL
+Frameworks: React, Next.js, Node.js, Express
+Tools: Docker, Google Cloud Run, Cloudflare, Git, GitHub
+AI/ML: PyTorch, TensorFlow, Scikit-learn, HuggingFace, RAG, OCR
+Data: PostgreSQL, Pandas, NumPy
+Other: Jupyter Notebook, Kaggle
+
+EDUCATION
+Bachelor of Technology in Computer Science Engineering (AI & ML) — PES University, 2028
+
+PROJECTS (optional)
+
+CLUBIN — Event Discovery & Booking Platform
+Built a scalable full-stack platform using Node.js, React Native, Next.js, PostgreSQL, and Docker with sub-100ms API response times and real-time booking features.
+
+SUMORA — AI Presentation Analysis Tool
+Developed an AI-powered system using OCR, RAG, and LLMs (Llama 3.1 via Groq API) to summarize and enable chat-based interaction with presentations.
+
+Domain-Specific NEET QA Model
+Fine-tuned a Qwen 3 model using LoRA on a hybrid dataset, improving accuracy by ~35% across Biology, Chemistry, and Physics.

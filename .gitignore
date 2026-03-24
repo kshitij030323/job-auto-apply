@@ -1,0 +1,8 @@
+.env
+credentials.json
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+.job-bot-browser/
+my_resume.pdf
