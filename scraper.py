@@ -1,23 +1,21 @@
 """
-scraper.py — Extracts job description text from a URL using Playwright.
-Works for LinkedIn, Lever, Greenhouse, Workday, and generic pages.
+scraper.py — Extracts job descriptions by screenshotting pages and using AI vision.
+
+The AI literally sees the rendered page and extracts the job info — no CSS selectors.
 """
 import logging
-import re
 from urllib.parse import urlparse, parse_qs
 
 from playwright.async_api import async_playwright, Page
 
 from config import Config
+from ai_agent import take_screenshot, extract_job_from_screenshot
 
 log = logging.getLogger(__name__)
 
 
 def _normalize_linkedin_url(url: str) -> str:
-    """
-    Convert LinkedIn collection/search URLs to direct job view URLs.
-    e.g. .../jobs/collections/recommended/?currentJobId=123... → .../jobs/view/123
-    """
+    """Convert LinkedIn collection/search URLs to direct job view URLs."""
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     job_id = params.get("currentJobId", [None])[0]
@@ -28,73 +26,16 @@ def _normalize_linkedin_url(url: str) -> str:
 
 async def scrape_job_description(url: str) -> dict:
     """
-    Visit a job URL, extract structured info.
+    Visit a job URL, screenshot it, and ask AI to extract the job info.
     Returns: {"title": str, "company": str, "description": str, "url": str}
-
-    For LinkedIn URLs, reuses the existing AutoApplier browser session
-    (which holds login cookies) instead of launching a second persistent
-    context on the same profile directory.
     """
     is_linkedin = "linkedin.com" in url
 
     if is_linkedin:
         url = _normalize_linkedin_url(url)
-
-    # For LinkedIn, try to reuse the running AutoApplier browser session.
-    # This avoids the "profile already locked" crash when both the applier
-    # and scraper try to open the same persistent browser directory.
-    if is_linkedin:
         return await _scrape_with_applier_browser(url)
 
-    # For non-LinkedIn URLs, launch a standalone browser.
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=Config.HEADLESS)
-        page = await browser.new_page()
-
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)  # let JS render
-
-            if "lever.co" in url:
-                return await _extract_lever(page, url)
-            elif "greenhouse.io" in url or "boards.greenhouse" in url:
-                return await _extract_greenhouse(page, url)
-            else:
-                return await _extract_generic(page, url)
-        except Exception as e:
-            log.error("Scraping failed for %s: %s (type: %s)", url, e, type(e).__name__)
-            return {"title": "", "company": "", "description": "", "url": url}
-        finally:
-            await page.close()
-            await browser.close()
-
-
-async def _scrape_with_applier_browser(url: str) -> dict:
-    """Scrape a LinkedIn URL using the shared AutoApplier browser session."""
-    from auto_apply import get_applier
-
-    try:
-        applier = await get_applier()
-        if applier.context is None:
-            raise RuntimeError("Browser session not available — run 'login' first")
-        page = await applier.context.new_page()
-    except Exception as e:
-        log.warning("Shared browser not available (%s), launching standalone browser", e)
-        return await _scrape_linkedin_standalone(url)
-
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(3000)
-        return await _extract_linkedin(page, url)
-    except Exception as e:
-        log.error("Scraping failed for %s: %s (type: %s)", url, e, type(e).__name__)
-        return {"title": "", "company": "", "description": "", "url": url}
-    finally:
-        await page.close()
-
-
-async def _scrape_linkedin_standalone(url: str) -> dict:
-    """Fallback: scrape LinkedIn with a fresh non-persistent browser."""
+    # Non-LinkedIn: standalone browser
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=Config.HEADLESS,
@@ -103,97 +44,117 @@ async def _scrape_linkedin_standalone(url: str) -> dict:
         page = await browser.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
-            return await _extract_linkedin(page, url)
+            await page.wait_for_timeout(4000)
+            return await _extract_via_screenshot(page, url)
         except Exception as e:
-            log.error("Scraping failed for %s: %s (type: %s)", url, e, type(e).__name__)
+            log.error("Scraping failed for %s: %s", url, e)
             return {"title": "", "company": "", "description": "", "url": url}
         finally:
             await page.close()
             await browser.close()
 
 
-async def _extract_linkedin(page: Page, url: str) -> dict:
-    # Wait for job detail content to load
+async def _scrape_with_applier_browser(url: str) -> dict:
+    """Scrape LinkedIn using the shared browser session (has login cookies)."""
+    from auto_apply import get_applier
+
     try:
-        await page.wait_for_selector(
-            ".description__text, .show-more-less-html__markup, "
-            ".jobs-description__content, .jobs-description, "
-            "section.description, .job-details-jobs-unified-top-card__job-title",
-            timeout=10000,
+        applier = await get_applier()
+        if applier.context is None:
+            raise RuntimeError("Browser not available — run 'login' first")
+        page = await applier.context.new_page()
+    except Exception as e:
+        log.warning("Shared browser not available (%s), using standalone", e)
+        return await _scrape_standalone(url)
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(4000)
+
+        # Scroll down to load the full job description
+        await page.evaluate("window.scrollBy(0, 300)")
+        await page.wait_for_timeout(1000)
+
+        # Try clicking "Show more" / "See more" if visible
+        try:
+            show_more = page.locator("button:has-text('Show more'), button:has-text('See more'), button:has-text('...more')").first
+            if await show_more.count() > 0 and await show_more.is_visible():
+                await show_more.click()
+                await page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+        return await _extract_via_screenshot(page, url)
+    except Exception as e:
+        log.error("Scraping failed for %s: %s", url, e)
+        return {"title": "", "company": "", "description": "", "url": url}
+    finally:
+        await page.close()
+
+
+async def _scrape_standalone(url: str) -> dict:
+    """Fallback: scrape with a fresh browser."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=Config.HEADLESS,
+            args=["--disable-blink-features=AutomationControlled"],
         )
-    except Exception:
-        log.warning("LinkedIn job detail selectors did not appear — page may require login")
-
-    title = await _safe_text(
-        page,
-        "h1.top-card-layout__title, h1.topcard__title, "
-        ".job-details-jobs-unified-top-card__job-title, "
-        ".jobs-unified-top-card__job-title, h1",
-    )
-    company = await _safe_text(
-        page,
-        "a.topcard__org-name-link, "
-        ".top-card-layout__second-subline a, "
-        ".topcard__flavor--black-link, "
-        ".job-details-jobs-unified-top-card__company-name, "
-        ".jobs-unified-top-card__company-name",
-    )
-    desc = await _safe_text(
-        page,
-        ".description__text, "
-        ".show-more-less-html__markup, "
-        ".jobs-description__content, "
-        ".jobs-description, "
-        "section.description, "
-        "article.jobs-description__container",
-    )
-
-    if not desc:
-        log.warning("No job description found on LinkedIn page: %s", url)
-
-    return {"title": title, "company": company, "description": _clean(desc), "url": url}
+        page = await browser.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(4000)
+            return await _extract_via_screenshot(page, url)
+        except Exception as e:
+            log.error("Scraping failed for %s: %s", url, e)
+            return {"title": "", "company": "", "description": "", "url": url}
+        finally:
+            await page.close()
+            await browser.close()
 
 
-async def _extract_lever(page: Page, url: str) -> dict:
-    title = await _safe_text(page, "h2.posting-headline, .posting-headline h2")
-    company = await _safe_text(page, ".main-header-logo a, .posting-categories .sort-by-time, .company-name")
-    desc = await _safe_text(page, "[data-qa='job-description'], .section-wrapper.page-full-width, .posting-page")
-    return {"title": title, "company": company, "description": _clean(desc), "url": url}
+async def _extract_via_screenshot(page: Page, url: str) -> dict:
+    """
+    Take a screenshot + grab page text, send both to AI for extraction.
+    The AI SEES the actual rendered page.
+    """
+    # Take screenshot of what's visible
+    screenshot_b64 = await take_screenshot(page)
 
-
-async def _extract_greenhouse(page: Page, url: str) -> dict:
-    title = await _safe_text(page, "h1.app-title, .app-title")
-    company = await _safe_text(page, "span.company-name, .company-name")
-    desc = await _safe_text(page, "#content, .content")
-    return {"title": title, "company": company, "description": _clean(desc), "url": url}
-
-
-async def _extract_generic(page: Page, url: str) -> dict:
-    title = await _safe_text(page, "h1")
-    # Try common patterns for company name
-    company = await _safe_text(page, "[class*='company'], [class*='org'], [data-company], [class*='employer']")
-    # Get the main content area
-    desc = await _safe_text(page, "main, article, [role='main'], .job-description, #job-description, [class*='description']")
-    if not desc:
-        desc = await _safe_text(page, "body")
-    desc = desc[:5000] if desc else ""
-    return {"title": title, "company": company, "description": _clean(desc), "url": url}
-
-
-async def _safe_text(page: Page, selector: str) -> str:
-    """Safely extract text from the first matching element."""
+    # Also grab raw text as backup context
     try:
-        locator = page.locator(selector)
-        if await locator.count() > 0:
-            return (await locator.first.inner_text()).strip()
+        page_text = await page.evaluate("() => document.body.innerText || ''")
+    except Exception:
+        page_text = ""
+
+    if not screenshot_b64 and not page_text:
+        log.warning("Could not capture page content at all")
+        return {"title": "", "company": "", "description": "", "url": url}
+
+    # Also try to get a full-page screenshot for long JDs
+    # by scrolling and getting the text below the fold
+    try:
+        full_text = await page.evaluate("""() => {
+            const body = document.body.innerText || '';
+            return body.substring(0, 8000);
+        }""")
+        if len(full_text) > len(page_text):
+            page_text = full_text
     except Exception:
         pass
-    return ""
 
+    if not Config.LLM_API_KEY:
+        log.warning("No LLM_API_KEY — returning raw text as description")
+        return {"title": "", "company": "", "description": page_text[:5000], "url": url}
 
-def _clean(text: str) -> str:
-    """Collapse whitespace, strip cruft."""
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
+    # Ask AI to extract job info from what it sees
+    result = extract_job_from_screenshot(screenshot_b64, page_text, url)
+
+    if result.get("description"):
+        log.info("AI extracted: '%s' at '%s' (%d chars)",
+                 result.get("title", "")[:50], result.get("company", "")[:30],
+                 len(result["description"]))
+    else:
+        log.warning("AI couldn't extract description — using raw text fallback")
+        result["description"] = page_text[:5000]
+
+    return result

@@ -19,7 +19,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright, Page, BrowserContext
 
 from config import Config
-from ai_agent import run_agent, extract_page_state, ask_ai
+from ai_agent import run_agent
 
 log = logging.getLogger(__name__)
 
