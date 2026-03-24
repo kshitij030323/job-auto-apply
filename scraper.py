@@ -4,7 +4,6 @@ Works for LinkedIn, Lever, Greenhouse, Workday, and generic pages.
 """
 import logging
 import re
-from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from playwright.async_api import async_playwright, Page
@@ -12,9 +11,6 @@ from playwright.async_api import async_playwright, Page
 from config import Config
 
 log = logging.getLogger(__name__)
-
-# Persistent browser profile path (shared with auto_apply.py)
-_BROWSER_DATA_DIR = str(Path.home() / ".job-bot-browser")
 
 
 def _normalize_linkedin_url(url: str) -> str:
@@ -34,35 +30,32 @@ async def scrape_job_description(url: str) -> dict:
     """
     Visit a job URL, extract structured info.
     Returns: {"title": str, "company": str, "description": str, "url": str}
+
+    For LinkedIn URLs, reuses the existing AutoApplier browser session
+    (which holds login cookies) instead of launching a second persistent
+    context on the same profile directory.
     """
     is_linkedin = "linkedin.com" in url
 
     if is_linkedin:
         url = _normalize_linkedin_url(url)
 
+    # For LinkedIn, try to reuse the running AutoApplier browser session.
+    # This avoids the "profile already locked" crash when both the applier
+    # and scraper try to open the same persistent browser directory.
+    if is_linkedin:
+        return await _scrape_with_applier_browser(url)
+
+    # For non-LinkedIn URLs, launch a standalone browser.
     async with async_playwright() as p:
-        # Use persistent context for LinkedIn (needs login cookies),
-        # plain headless browser for everything else.
-        if is_linkedin:
-            browser = await p.chromium.launch_persistent_context(
-                user_data_dir=_BROWSER_DATA_DIR,
-                headless=Config.HEADLESS,
-                viewport={"width": 1280, "height": 900},
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            page = await browser.new_page()
-        else:
-            browser = await p.chromium.launch(headless=Config.HEADLESS)
-            page = await browser.new_page()
+        browser = await p.chromium.launch(headless=Config.HEADLESS)
+        page = await browser.new_page()
 
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(3000)  # let JS render
 
-            # Detect platform and extract accordingly
-            if is_linkedin:
-                return await _extract_linkedin(page, url)
-            elif "lever.co" in url:
+            if "lever.co" in url:
                 return await _extract_lever(page, url)
             elif "greenhouse.io" in url or "boards.greenhouse" in url:
                 return await _extract_greenhouse(page, url)
@@ -74,6 +67,28 @@ async def scrape_job_description(url: str) -> dict:
         finally:
             await page.close()
             await browser.close()
+
+
+async def _scrape_with_applier_browser(url: str) -> dict:
+    """Scrape a LinkedIn URL using the shared AutoApplier browser session."""
+    from auto_apply import get_applier
+
+    try:
+        applier = await get_applier()
+        page = await applier.context.new_page()
+    except Exception as e:
+        log.error("Could not get browser session for scraping: %s", e)
+        return {"title": "", "company": "", "description": "", "url": url}
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(3000)
+        return await _extract_linkedin(page, url)
+    except Exception as e:
+        log.error("Scraping failed for %s: %s (type: %s)", url, e, type(e).__name__)
+        return {"title": "", "company": "", "description": "", "url": url}
+    finally:
+        await page.close()
 
 
 async def _extract_linkedin(page: Page, url: str) -> dict:
