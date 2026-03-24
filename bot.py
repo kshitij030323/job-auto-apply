@@ -195,6 +195,11 @@ def _run_setup():
 
 async def do_login():
     """Log into LinkedIn."""
+    if not Config.LINKEDIN_EMAIL or not Config.LINKEDIN_PASSWORD:
+        print(f"{RED}❌ LINKEDIN_EMAIL and LINKEDIN_PASSWORD must be set in .env{RESET}")
+        print(f"{DIM}Run 'setup' to configure them, or add them to your .env file.{RESET}")
+        return
+
     print(f"{CYAN}🔐 Logging into LinkedIn...{RESET}")
     applier = await get_applier()
     success = await applier.linkedin_login()
