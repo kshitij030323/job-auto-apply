@@ -1,14 +1,14 @@
 """
 auto_apply.py — AI-powered auto-apply engine.
 
-Uses an LLM (Qwen 3.5 via NVIDIA NIM) to understand web pages and
-intelligently fill job application forms — no brittle CSS selectors.
+The AI SEES the screen via screenshots and controls the browser like a human.
+It follows external links, handles redirects, fills multi-page forms, and submits.
 
 Two modes:
 1. LinkedIn Easy Apply — AI navigates the modal step by step
-2. Generic portal — AI fills the form, leaves it for user review
+2. External / Generic — AI follows the "Apply" link to any portal and applies there
 
-IMPORTANT: This runs YOUR browser on YOUR machine. It's your account, your actions.
+The AI is used at EVERY step — it decides what to fill, what to click, where to go.
 """
 import asyncio
 import logging
@@ -82,7 +82,6 @@ class AutoApplier:
         await page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
 
-        # Check if already logged in
         if "/feed" in page.url and await page.locator("input.search-global-typeahead__input").count() > 0:
             log.info("Already logged into LinkedIn")
             await page.close()
@@ -93,11 +92,9 @@ class AutoApplier:
             await page.close()
             return False
 
-        # Navigate to login page
         await page.goto("https://www.linkedin.com/login")
         await page.wait_for_timeout(2000)
 
-        # Let AI handle the login form — it can see what's on the page
         login_info = dict(self.info)
         login_info["linkedin_email"] = Config.LINKEDIN_EMAIL
         login_info["linkedin_password"] = Config.LINKEDIN_PASSWORD
@@ -113,7 +110,6 @@ class AutoApplier:
 
         if result.get("needs_human"):
             log.warning("Security challenge detected — solve it manually in the browser!")
-            # Wait for manual resolution
             for _ in range(24):
                 await page.wait_for_timeout(5000)
                 if "/feed" in page.url:
@@ -125,13 +121,11 @@ class AutoApplier:
 
         await page.wait_for_timeout(3000)
 
-        # Verify login
         if "/feed" in page.url or "/mynetwork" in page.url:
             log.info("LinkedIn login successful")
             await page.close()
             return True
 
-        # Check current state
         if "checkpoint" in page.url or "challenge" in page.url:
             log.warning("Security challenge — solve it in the browser window!")
             for _ in range(24):
@@ -152,8 +146,11 @@ class AutoApplier:
 
     async def linkedin_easy_apply(self, job_url: str, job_description: str = "", on_step: callable = None) -> dict:
         """
-        Apply to a LinkedIn job via Easy Apply — AI navigates the entire flow.
-        Returns: {"success": bool, "message": str}
+        Apply to a LinkedIn job. Handles both:
+        - Easy Apply (modal on LinkedIn)
+        - External Apply (follows link to company portal and applies there)
+
+        The AI screenshots the page and decides what to do at every step.
         """
         page = await self.context.new_page()
         result = {"success": False, "message": ""}
@@ -162,92 +159,176 @@ class AutoApplier:
             await page.goto(job_url, wait_until="domcontentloaded")
             await page.wait_for_timeout(3000)
 
-            # Click the Easy Apply button first
+            # Check for Easy Apply button
             easy_btn = page.locator("button.jobs-apply-button, button:has-text('Easy Apply')").first
-            if await easy_btn.count() == 0:
-                result["message"] = "No Easy Apply button found — may require external application"
+            if await easy_btn.count() > 0:
+                # ── Easy Apply flow ──
+                await easy_btn.click()
+                await page.wait_for_timeout(2000)
+
+                resume_text = _load_resume_text()
+                agent_result = await run_agent(
+                    page=page,
+                    goal=(
+                        "You are inside a LinkedIn Easy Apply modal. Fill ALL form fields "
+                        "with my personal info. For each step:\n"
+                        "1. Fill all empty fields with appropriate values from my info\n"
+                        "2. Upload my resume if there's a file input\n"
+                        "3. Click 'Next', 'Review', or 'Submit application' to proceed\n"
+                        "4. When you see a confirmation/success message, report status 'done'\n"
+                        "5. For questions like years of experience, salary, etc. — answer reasonably based on my resume\n"
+                        "6. For Yes/No questions about work authorization, willingness to relocate, etc. — select Yes\n"
+                        "7. Do NOT hesitate — fill everything and keep clicking Next/Submit until done"
+                    ),
+                    personal_info=self.info,
+                    resume_text=resume_text,
+                    job_description=job_description,
+                    max_steps=20,
+                    on_step=on_step or (lambda s, t: log.info("Easy Apply step %d: %s", s, t[:100])),
+                )
+
+                result["success"] = agent_result.get("success", False)
+                result["message"] = agent_result.get("message", "")
+                if agent_result.get("success"):
+                    result["message"] = f"Application submitted via Easy Apply ({agent_result['steps']} AI steps)"
                 return result
 
-            await easy_btn.click()
-            await page.wait_for_timeout(2000)
-
-            # Now let the AI handle the multi-step modal
-            resume_text = _load_resume_text()
-            agent_result = await run_agent(
-                page=page,
-                goal=(
-                    "You are inside a LinkedIn Easy Apply modal. Fill in all the form fields "
-                    "with my personal info. For each step:\n"
-                    "1. Fill all empty fields with appropriate values from my info\n"
-                    "2. Upload my resume if there's a file input\n"
-                    "3. Click 'Next', 'Review', or 'Submit application' to proceed\n"
-                    "4. When you see a confirmation/success message, report status 'done'\n"
-                    "5. For questions like years of experience, salary, etc. — answer reasonably based on my resume\n"
-                    "6. For Yes/No questions about work authorization, willingness to relocate, etc. — select Yes"
-                ),
-                personal_info=self.info,
-                resume_text=resume_text,
-                job_description=job_description,
-                max_steps=15,
-                on_step=on_step or (lambda s, t: log.info("Easy Apply step %d: %s", s, t[:100])),
-            )
-
-            result["success"] = agent_result.get("success", False)
-            result["message"] = agent_result.get("message", "")
-            if agent_result.get("success"):
-                result["message"] = f"Application submitted via Easy Apply ({agent_result['steps']} AI steps)"
-            return result
+            # ── No Easy Apply — check for external Apply button ──
+            log.info("No Easy Apply button — looking for external Apply link...")
+            external_result = await self._follow_external_apply(page, job_description, on_step)
+            return external_result
 
         except Exception as e:
-            result["message"] = f"Error during Easy Apply: {e}"
+            result["message"] = f"Error during apply: {e}"
             log.error(result["message"])
             return result
         finally:
             await page.close()
 
+    async def _follow_external_apply(self, page: Page, job_description: str, on_step: callable = None) -> dict:
+        """
+        When LinkedIn shows an external 'Apply' button, follow it to the company
+        portal and let the AI apply there. The AI sees the screen and handles everything.
+        """
+        result = {"success": False, "message": ""}
+
+        # Use AI to find and click the external apply button
+        resume_text = _load_resume_text()
+        agent_result = await run_agent(
+            page=page,
+            goal=(
+                "Look at the page. Find the 'Apply' button (it may say 'Apply', 'Apply now', "
+                "'Apply on company website', or similar). Click it to go to the external application page. "
+                "If you see a popup asking to continue to external site, click 'Continue' or 'Apply'. "
+                "Once you land on the external application page, report status 'done' so we can proceed."
+            ),
+            personal_info=self.info,
+            resume_text="",
+            max_steps=5,
+            on_step=on_step or (lambda s, t: log.info("External nav step %d: %s", s, t[:100])),
+        )
+
+        # Wait for potential navigation/redirect
+        await page.wait_for_timeout(3000)
+        current_url = page.url
+        log.info("Navigated to external page: %s", current_url)
+
+        # Now the AI is on the external portal — let it fill the application
+        log.info("AI is now on external portal — filling application form...")
+        apply_result = await run_agent(
+            page=page,
+            goal=(
+                "You are on a job application page (external company portal). "
+                "Fill in ALL form fields with my personal info. This is a REAL application — "
+                "be thorough and fill everything:\n"
+                "1. Fill name, email, phone, location, and all other fields\n"
+                "2. Upload my resume if there's a file upload field\n"
+                "3. For custom questions (years of experience, salary, visa, etc.) answer reasonably based on my resume\n"
+                "4. For Yes/No questions about work authorization, willingness to relocate — select Yes\n"
+                "5. If there are multiple pages/steps, fill each page and click Next/Continue\n"
+                "6. Click Submit/Apply when all fields are filled\n"
+                "7. If you see a success/confirmation message, report 'done'\n"
+                "8. If you need to create an account first, try to do it with my email\n"
+                "9. Do NOT skip any fields — fill EVERYTHING you can\n"
+                "10. If the page requires login to a portal you don't have access to, report 'needs_human'"
+            ),
+            personal_info=self.info,
+            resume_text=resume_text,
+            job_description=job_description,
+            max_steps=25,
+            on_step=on_step or (lambda s, t: log.info("External apply step %d: %s", s, t[:100])),
+        )
+
+        result["success"] = apply_result.get("success", False)
+        result["message"] = apply_result.get("message", "")
+        if apply_result.get("success"):
+            result["message"] = f"Applied via external portal ({apply_result['steps']} AI steps)"
+        elif apply_result.get("needs_human"):
+            result["message"] = f"External portal needs human help: {apply_result.get('message', '')}"
+            result["needs_review"] = True
+        return result
+
     # ─── Generic Portal Apply (AI-driven) ────────────────────────────────────────
 
     async def generic_apply(self, apply_url: str, job_description: str = "", on_step: callable = None) -> dict:
         """
-        AI-powered form filling for any job application portal.
-        Returns: {"success": bool, "message": str, "needs_review": bool}
+        AI-powered application for any job portal URL.
+        The AI screenshots the screen, fills forms, follows links, and submits.
         """
         page = await self.context.new_page()
-        result = {"success": False, "message": "", "needs_review": True}
+        result = {"success": False, "message": ""}
 
         try:
             await page.goto(apply_url, wait_until="domcontentloaded")
             await page.wait_for_timeout(3000)
 
             resume_text = _load_resume_text()
+
+            # First, check if this is a job listing page (not an application form)
+            # The AI will figure out if it needs to click "Apply" first
             agent_result = await run_agent(
                 page=page,
                 goal=(
-                    "You are on a job application form. Fill in all the form fields "
-                    "with my personal info. Upload my resume if there's a file upload. "
-                    "Fill in all fields you can identify — name, email, phone, location, etc. "
-                    "For custom questions, answer based on my resume. "
-                    "Do NOT click the final Submit button — just fill all fields and report 'done'. "
-                    "The user will review and submit manually."
+                    "You are on a job-related page. Your goal is to APPLY for this job. "
+                    "Look at the screenshot carefully:\n\n"
+                    "IF this is a job listing page (shows job description, not a form):\n"
+                    "  - Find and click the 'Apply', 'Apply Now', 'Apply for this job' button\n"
+                    "  - Follow any redirects to the application form\n\n"
+                    "IF this is an application form:\n"
+                    "  - Fill ALL fields with my personal info\n"
+                    "  - Upload my resume to any file upload field\n"
+                    "  - For custom questions, answer based on my resume\n"
+                    "  - For Yes/No questions (work authorization, relocate, etc.) — select Yes\n"
+                    "  - Navigate through all steps (click Next/Continue)\n"
+                    "  - Click Submit/Apply at the end\n\n"
+                    "IF the page asks to login/create account:\n"
+                    "  - Try creating an account with my email if possible\n"
+                    "  - If login is required and you can't proceed, report 'needs_human'\n\n"
+                    "IMPORTANT: Do NOT stop at just filling fields — keep going through "
+                    "all steps until the application is SUBMITTED. Fill EVERY field you can. "
+                    "When you see a confirmation/success message, report 'done'."
                 ),
                 personal_info=self.info,
                 resume_text=resume_text,
                 job_description=job_description,
-                max_steps=10,
-                on_step=on_step or (lambda s, t: log.info("Form fill step %d: %s", s, t[:100])),
+                max_steps=25,
+                on_step=on_step or (lambda s, t: log.info("Apply step %d: %s", s, t[:100])),
             )
 
-            result["success"] = True
-            result["message"] = agent_result.get("message", f"AI filled form in {agent_result.get('steps', '?')} steps")
-            result["needs_review"] = True
-            log.info("AI form fill complete — awaiting manual review")
+            result["success"] = agent_result.get("success", False)
+            result["message"] = agent_result.get("message", "")
+            if agent_result.get("success"):
+                result["message"] = f"Application submitted ({agent_result['steps']} AI steps)"
+            elif agent_result.get("needs_human"):
+                result["needs_review"] = True
             return result
 
         except Exception as e:
-            result["message"] = f"Error filling form: {e}"
+            result["message"] = f"Error: {e}"
             log.error(result["message"])
             return result
-        # NOTE: don't close page — let user review and submit manually
+        finally:
+            await page.close()
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
